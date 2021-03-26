@@ -33,22 +33,28 @@ viz_style = {
 plt.style.use(viz_style)
 
 class ElectionResults:
-    def __init__(self, config, state, district_type, excel_header=[0,1]):
+    def __init__(self, config, state, district_type, kos_skiprows=0, excel_header=[0,1]):
         self.config = config
         self.state = state
         self.district_type = 'House' if district_type.title() == 'Assembly' else district_type.title()
 
-        self.data = self.init_elections_data(excel_header)
+        self.data = self.init_elections_data(excel_header, kos_skiprows)
         self.statewide_margins, self.D_votes, self.R_votes = self.calc_sort_statewide_margins()
         self.margin_trends, self.D_votes_trends, self.R_votes_trends = self.calc_kos_election_trends()
 
-    def init_elections_data(self, excel_header):
+
+    def recalculate_margins(self):
+        self.statewide_margins, self.D_votes, self.R_votes = self.calc_sort_statewide_margins()
+        self.margin_trends, self.D_votes_trends, self.R_votes_trends = self.calc_kos_election_trends()
+
+
+    def init_elections_data(self, excel_header, kos_skiprows):
         # read state-wide results -- i.e., Daily Kos Election results by LD
         dat = pd.read_excel(os.path.join(self.config['data_path'],
                                          self.config['state_wide']['kos_filename']),
                             sheet_name=self.config['{}_districts'.format(
                                 self.district_type.lower())][self.state]['sheet_name'],
-                            header=excel_header
+                            header=excel_header, skiprows=kos_skiprows
                            )
 
         # drop empty columns (used to create readable space in the spreadsheet)
@@ -61,9 +67,15 @@ class ElectionResults:
         # set index to reflect the district
         index_name = tuple(self.config['{}_districts'.format(self.district_type.lower())][self.state]['kos_index'])
         dat.set_index(index_name, inplace=True)
+        dat.index.rename('District', inplace=True)
 
         db = {'state_wide': dat}
         return db
+
+
+    def add_new_statewide_data(self, add_data):
+        self.data['state_wide'] = pd.concat([self.data['state_wide'], add_data], axis=1)
+        self.recalculate_margins()
 
     def add_to_database(self, add_data=None, label=None, index=None):
 
@@ -92,8 +104,9 @@ class ElectionResults:
     def calc_sort_statewide_margins(self):
 
         # get set of elections in the spreadsheet (ignore duplicates and the Assembly summary columns)
+        # second check is to eliminate date ranges, which exist in the general headers of some states
         elections = [s for s in set(self.data['state_wide'].columns.get_level_values(0))
-                     if re.search(r'\d{4}',s) is not None]
+                     if re.search(r'\d{4}', s) and re.search(r'\d{4}-\d{4}', s) is None]
 
         # store this information
         self.elections = elections
@@ -208,7 +221,7 @@ class ElectionResults:
         window_colors = ['#40B0C9','#406BC9','#9D40C9']
 
         if 'district_margins' not in self.datasets:
-            raise ValueError('This function requires a dataset called "district_margsins" \
+            raise ValueError('This function requires a dataset called "district_margins" \
              containing all the district-level margins')
 
         if 'LDI' not in self.datasets:
@@ -308,7 +321,7 @@ class ElectionResults:
         corr_color = '#B73F93'
 
         if 'district_margins' not in self.datasets:
-            raise ValueError('This function requires a dataset called "district_margsins" \
+            raise ValueError('This function requires a dataset called "district_margins" \
              containing all the district-level margins')
 
         if 'LDI' not in self.datasets:
