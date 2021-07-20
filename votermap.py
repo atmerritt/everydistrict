@@ -47,9 +47,9 @@ class VoterMapAPI:
     @property
     def district_key(self):
         try:
-            key = self.search_columns('{}_District'.format(self.district_type))[0]
+            key = self.search_columns('{}_District'.format(self.district_type))[-1] # most recent
         except IndexError:
-            key = self.search_columns('Legislative_District')[0]
+            key = self.search_columns('Legislative_District')[-1] # most recent
         return key
 
 
@@ -232,9 +232,9 @@ def get_district_demographics(view_column, api=None, filter_dict=None,
 
     # identify the district column you need to use
     try:
-        district_key = api.search_columns('{}_District'.format(api.district_type))[0]
+        district_key = api.search_columns('{}_District'.format(api.district_type))[-1] # most recent
     except IndexError:
-        district_key = api.search_columns('Legislative_District')[0]
+        district_key = api.search_columns('Legislative_District')[-1] # most recent
 
     if district_list is None:
         #district_list = list(range(1,num_districts+1))

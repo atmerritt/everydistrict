@@ -3,12 +3,18 @@ import numpy as np
 import os
 import re
 
+import random
+import scipy.stats as st
+
 import geopandas as gpd
 from datashader.utils import lnglat_to_meters
 
 from sklearn.metrics import r2_score
 
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.gridspec as gridspec
+
 viz_style = {
     'font.family': 'sans-serif',
     'font.size':11,
@@ -39,12 +45,12 @@ class ElectionResults:
         self.district_type = 'House' if district_type.title() == 'Assembly' else district_type.title()
 
         self.data = self.init_elections_data(excel_header, kos_skiprows)
-        self.statewide_margins, self.D_votes, self.R_votes = self.calc_sort_statewide_margins()
+        self.statewide_margins, self.D_votes, self.R_votes, self.n_votes = self.calc_sort_statewide_margins()
         self.margin_trends, self.D_votes_trends, self.R_votes_trends = self.calc_kos_election_trends()
 
 
     def recalculate_margins(self):
-        self.statewide_margins, self.D_votes, self.R_votes = self.calc_sort_statewide_margins()
+        self.statewide_margins, self.D_votes, self.R_votes, self.n_votes = self.calc_sort_statewide_margins()
         self.margin_trends, self.D_votes_trends, self.R_votes_trends = self.calc_kos_election_trends()
 
 
@@ -117,14 +123,25 @@ class ElectionResults:
         statewide_margins = {}
         dem_votes = {}
         rep_votes = {}
+        n_votes = {}
         election_yrs, election_types = [],[]
         for election in elections:
             # identify the democratic and republican candidates in this election
             d_name, r_name = [mi for mi in self.data['state_wide'].columns if election in mi and mi[1][-1]=='%']
+            tot_col = [mi for mi in self.data['state_wide'].columns if election in mi and 'Total' in mi][0]
 
             # save democratic and republican votes (percentages)
             dem_votes[election] = 100*self.data['state_wide'][d_name]
             rep_votes[election] = 100*self.data['state_wide'][r_name]
+            n_votes[election] = self.data['state_wide'][tot_col]
+
+            #print(d_name)
+            #print(tot_col)
+            #print('\n\n\n')
+
+            #print(dem_votes[election])
+            #print('\n\n')
+            #print(n_votes[election])
 
             # calculate the margin by which the democratic candidate won or lost
             # and convert units from fraction to percentage-points
@@ -145,19 +162,22 @@ class ElectionResults:
         df_d.index.rename('District', inplace=True)
         df_r = pd.DataFrame(data=rep_votes)
         df_r.index.rename('District', inplace=True)
+        df_n = pd.DataFrame(data=n_votes)
+        df_n.index.rename('District', inplace=True)
 
         # sort chronologically
         cols_chron = np.array([x for _,x in sorted(zip(election_yrs, df_marg.columns))])
         df_marg_sorted = df_marg.loc[:,cols_chron]
         df_d_sorted = df_d.loc[:,cols_chron]
         df_r_sorted = df_r.loc[:,cols_chron]
+        df_n_sorted = df_n.loc[:,cols_chron]
 
         # keep track of the sorted order
         self.election_types_chron = np.array([x for _,x in sorted(zip(election_yrs,election_types))])
         self.election_years_chron = np.array(sorted(election_yrs))
         self.elections_chron = np.array([' '.join(map(str, tup)) for tup in zip(self.election_years_chron, self.election_types_chron)])
 
-        return df_marg_sorted, df_d_sorted, df_r_sorted
+        return df_marg_sorted, df_d_sorted, df_r_sorted, df_n_sorted
 
     def calc_kos_election_trends(self):
         """
@@ -180,12 +200,13 @@ class ElectionResults:
 
         return margin_trends, D_votes_trends, R_votes_trends
 
-    def running_average_statewide(self, window_years=2, use_data='dem_votes',
-            verbose=False):
+    def running_average_statewide(self, window_years=2, end_year=2022,
+        use_data='dem_votes', verbose=False):
 
         # skip the first year because there's nothing before it to average ...
         # and also add 2020
-        years = list(np.unique(self.election_years_chron)[1:])+[2020]
+        #years = list(np.unique(self.election_years_chron)[1:])+[2020]
+        years = list(range(self.election_years_chron[1], end_year+1))
 
         # what data are we using?
         if use_data == 'dem_votes':
@@ -238,7 +259,7 @@ class ElectionResults:
             # labels etc
             axes[0, ind].set_title(str(year))
             axes[0, ind].set_xlabel('data')
-            axes[0, ind].set_ylabel('model')
+            axes[0, ind].set_ylabel('model margins')
             axes[1, ind].set_xlabel('data')
             axes[1, ind].set_ylabel('data - model')
             axes[1, ind].set_ylim(-40,40)
@@ -269,7 +290,8 @@ class ElectionResults:
             use_ms = 5
             for window, window_color in zip(windows, window_colors):
                 # obtain prediction for votes -> margins using this type of averaging
-                dvotes_pred = self.running_average_statewide(window_years=window)
+                dvotes_pred = self.running_average_statewide(window_years=window,
+                                                             use_data='dem_votes')
                 margins_pred = demvotes2margin(dvotes_pred[str(year)])
 
                 # plot where elections occured
@@ -485,8 +507,196 @@ class ElectionResults:
     def datasets(self):
         return list(self.data.keys())
 
+    ########## MODELING BITS ############
+
+    def grab_elections_in_window(self, year, window_years=4):
+        window_elections = [et for (ey, et) in zip(self.election_years_chron, self.elections_chron) if
+                            year - ey <= window_years and year - ey > 0]
+        return window_elections
+
+    def estimate_pop_D_proportion(self, ci=0.90):
+        p_hat = self.D_votes/100 # best estimate
+        se_phat = np.sqrt(p_hat*(1-p_hat)/self.n_votes) # standard error
+
+        moe = st.norm.ppf(ci + (1-ci)/2) * se_phat
+        return p_hat, moe
+
+    def estimate_pop_prop_diffs(self, trends, ci=0.90):
+        pdiffs = self.D_votes_trends[trends]/100 # best estimate
+
+        se_trends = {}
+        for trend in trends:
+            p1_name, p2_name = trend
+
+            p1 = self.D_votes[p1_name]/100
+            p2 = self.D_votes[p2_name]/100
+            n1 = self.n_votes[p1_name]
+            n2 = self.n_votes[p2_name]
+
+            se = np.sqrt((p1*(1-p1)/n1) + (p2*(1-p2)/n2)) # standard error
+            se_trends[trend] = se
+
+        se_df = pd.DataFrame(data=se_trends, columns=pdiffs.columns)
+        moe = st.norm.ppf(ci + (1-ci)/2) * se_df
+        return pdiffs, moe
+
+    def montecarlo_sampling(self, year=2020, window=4, n_iter=2000, sampling_dist_ci=0.90):
+        # set up: election results distributions
+        p_hat, moe = self.estimate_pop_D_proportion(ci=sampling_dist_ci)
+
+        # set up: past trends
+        trends = self._find_previous_trends(year)
+        pdiffs, moe_diffs = self.estimate_pop_prop_diffs(trends, ci=sampling_dist_ci)
+
+        # placeholder for results
+        iterated_avg_results, iterated_corr_results = {}, {}
+
+        # ready go
+        for iter_ in range(n_iter):
+            # grab the elections within the time window
+            try_elections = self.grab_elections_in_window(year, window_years=window)
+
+            # bootstrap elections and trends
+            bs_elections = bootstrap_from(try_elections)
+            bs_trends = bootstrap_from(trends)
+
+            # number of voters for each bootstrapped election
+            bs_numvoters = self.n_votes[bs_elections]
+
+            # draw results from the distribution of each election
+            # let the width of the distribution ~ 90% confidence interval
+            sampled_p, sampled_n, sampled_t = {}, {}, {}
+
+            for i, elec in enumerate(bs_elections):
+                sampled_p[i] = sample_from(p_hat[elec], moe[elec])
+                sampled_n[i] = self.n_votes[elec]
+
+            for i, trend in enumerate(bs_trends):
+                sampled_t[i] = sample_from(pdiffs[trend], moe_diffs[trend])
+
+            # convert to dataframes
+            sampled_demvotes = pd.DataFrame(data=sampled_p, index=self.D_votes.index)
+            sampled_numvotes = pd.DataFrame(data=sampled_n, index=self.D_votes.index)
+            sampled_trends = pd.DataFrame(data=sampled_t, index=self.D_votes.index)
+
+            # weighted average
+            w_avg = (sampled_demvotes.multiply(sampled_numvotes)).sum(axis=1).div(sampled_numvotes.sum(axis=1))
+
+            # weighted average corrected by an average trend
+            avg_trend = sampled_trends.mean(axis=1)
+            w_avg_corr = w_avg + avg_trend
+
+            # keep track of results
+            iterated_avg_results[iter_] = w_avg
+            iterated_corr_results[iter_] = w_avg_corr
+
+        out_avg = pd.DataFrame(data=iterated_avg_results)
+        out_avg.name = '{} model: {}-year window'.format(year, window)
+        out_corr = pd.DataFrame(data=iterated_corr_results)
+        out_corr.name = '{} model: {}-year window + trend corr'.format(year, window)
+
+        return out_avg, out_corr
+
+
+
 ######### OTHER UTILITY FUNCTIONS, NOT PART OF THE CLASS ############
 
 def demvotes2margin(demvotes):
     margin = 2*demvotes - 100
     return margin
+
+def margin2demvotes(margin):
+    demvotes = (margin + 100)/2
+    return demvotes
+
+
+def bootstrap_from(data):
+    return random.choices(data, k=len(data))
+
+def sample_from(mu, sigma):
+    return [random.gauss(mu.loc[i], sigma.loc[i]) for i in mu.index]
+
+
+
+def plot_montecarlo_model_viz(pred, test_data=None, ldi=None, figwidth=6, ref_color='#5C3099'):
+
+    if test_data is not None:
+        figheight = figwidth * 1.2
+    else:
+        figheight = figwidth
+        figwidth = figwidth*2
+
+    # define median
+    med = pred.quantile(q=0.50, axis=1)
+    sorted_med_inds = np.argsort(med)[::-1]
+
+    # define inner 90%
+    e_95_50 = pred.quantile(q=0.95, axis=1) - pred.quantile(q=0.50, axis=1)
+    e_50_05 = pred.quantile(q=0.50, axis=1) - pred.quantile(q=0.05, axis=1)
+
+    # define inner 50%
+    e_75_50 = pred.quantile(q=0.75, axis=1) - pred.quantile(q=0.50, axis=1)
+    e_50_25 = pred.quantile(q=0.50, axis=1) - pred.quantile(q=0.25, axis=1)
+
+    # set up figure
+    fig = plt.figure()
+    fig.suptitle(pred.name, y=0.95)
+    gs = fig.add_gridspec(4,4)
+    fig.set_figwidth(figwidth)
+    fig.set_figheight(figheight)
+
+    if test_data is not None:
+        fig.set_figwidth(figwidth*2)
+        fig.set_figheight(figheight*1.2)
+
+        ax_model = fig.add_subplot(gs[:,:2])
+        ax_model.set_xlim(0,1)
+        ax_compare = fig.add_subplot(gs[:2,2:])
+        ax_compare.set_xlim(0,1)
+        ax_ldi = fig.add_subplot(gs[2:,2:])
+        ax_ldi.set_xlim(0,1)
+
+    else:
+        ax_model = fig.add_subplot(gs[:,:2])
+        ax_model.set_xlim(0,1)
+        ax_ldi = fig.add_subplot(gs[:,2:])
+        ax_ldi.set_xlim(0,1)
+
+    ax_model.axvspan(0.45, 0.55, alpha=0.15, color='indigo')
+    ax_model.errorbar(med.iloc[sorted_med_inds], range(len(med)),
+                      xerr=[e_50_05.iloc[sorted_med_inds], e_95_50.iloc[sorted_med_inds]],
+                      fmt='o', ms=1.5, ecolor='#B2B2B3', elinewidth=2.5, color='k')
+    ax_model.errorbar(med.iloc[sorted_med_inds], range(len(med)),
+                      xerr=[e_50_25.iloc[sorted_med_inds], e_75_50.iloc[sorted_med_inds]],
+                      fmt='o', ms=2.5, ecolor='#5E5E5E', elinewidth=2.5, color='k') #5E5C88, 5B5BA0
+    ax_model.tick_params(left=False, labelleft=False)
+    ax_model.set_xlabel('Predicted Dem Fraction')
+    ax_model.spines['left'].set_visible(False);
+
+
+    ax_ldi.plot(np.linspace(0.25, 1, 10), np.linspace(0.25, 1, 10), '-', color=ref_color, lw=0.85, alpha=0.75)
+    ax_ldi.errorbar(med.values, (ldi + 100)/200,
+                     yerr=[e_50_05, e_95_50],
+                     fmt='o', ms=1.5, ecolor='#B2B2B3', elinewidth=1.9, color='k')
+    ax_ldi.errorbar(med.values, (ldi + 100)/200,
+                     yerr=[e_50_25, e_75_50],
+                     fmt='o', ms=2, ecolor='#5E5E5E', elinewidth=1.9, color='k')
+    ax_ldi.set_ylabel('original LDI')
+    ax_ldi.set_xlabel('model');
+
+    if test_data is not None:
+        # compare model to real results
+        ax_compare.axhline(y=0, ls='-', color=ref_color, lw=0.85, alpha=0.75)
+        ax_compare.errorbar(med.values, test_data - med.values,
+                         yerr=[e_50_05, e_95_50],
+                         fmt='o', ms=1.5, ecolor='#B2B2B3', elinewidth=1.9, color='k')
+        ax_compare.errorbar(med.values, test_data - med.values,
+                         yerr=[e_50_25, e_75_50],
+                         fmt='o', ms=2, ecolor='#5E5E5E', elinewidth=1.9, color='k')
+        ax_compare.set_xlabel('model')
+        ax_compare.set_ylabel('data - model')
+
+    fig.subplots_adjust(hspace=0.5, bottom=0.1)
+
+
+    return fig
